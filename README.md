@@ -1,4 +1,3 @@
-bla
 ROS-based controller for IRIS+ quadcopters
 ==========================================
 
@@ -94,7 +93,7 @@ source ./devel/setup.bash
 rqt --standalone  tabbedGUI --args Iris1/
 ~~~~
 
-Some notes:
+Remarks:
 
 1. runnning mavros: in order to access the device connected to ttyUSB0 (antenna), you may have to change same permissions 
 ```

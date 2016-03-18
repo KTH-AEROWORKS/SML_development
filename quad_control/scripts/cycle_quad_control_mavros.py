@@ -4,10 +4,13 @@
 import mavros
 
 from mavros_msgs.msg import OverrideRCIn
-# from mavros_msgs.srv import ParamSet
-# from mavros_msgs.srv import ParamGet
-# from mavros_msgs.srv import CommandBool
-# from mavros_msgs.srv import SetMode
+# from mavros_msgs.srv import ParamSet,ParamGet,CommandBool,SetMode
+
+# node will publish motor speeds
+from mav_msgs.msg import Actuators
+
+#node will subscribe to odometry measurements
+from nav_msgs.msg import Odometry
 
 import rospy
 
@@ -40,40 +43,23 @@ from rospkg import RosPack
 
 import numpy
 from numpy import *
-from numpy import cos as c
-from numpy import sin as s
 
-#-------------------------------------------------------#
-# from SomeFunctions import *
-from SomeFunctions import GetRotFromEulerAnglesDeg,Velocity_Filter
+from utility_functions import GetRotFromEulerAnglesDeg,Velocity_Filter
 
-#-------------------------------------------------------#
-controllers_dictionary = {}
-from Controller0 import ControllerPD
-controllers_dictionary[0] = ControllerPD
-from Controller1 import ControllerPID
-controllers_dictionary[1] = ControllerPID
-from Controller2 import ControllerPID_bounded
-controllers_dictionary[2] = ControllerPID_bounded
-from ControllerACRO import ControllerOmega 
-controllers_dictionary[3] = ControllerOmega
-from ControllerNeutral import ControllerNeutral
-controllers_dictionary[4] = ControllerNeutral
+# import list of available trajectories
+from TrajectoryPlanner import trajectories_dictionary
+from Quadrotor_Trajectory_Tracking_Controllers import controllers_dictionary
+from Yaw_Rate_Controller import yaw_controllers_dictionary
 
-controllers_with_state = [1,2]
 
-#-------------------------------------------------------#
-trajectories_dictionary = {}
+from ConverterBetweenStandards.RotorSConverter import RotorSConverter
+from ConverterBetweenStandards.IrisPlusConverter import IrisPlusConverter
 
-from Trajectory0 import traj_des_still
-trajectories_dictionary[0] = traj_des_still
-from Trajectory1 import traj_des_circle
-trajectories_dictionary[1] = traj_des_circle
-
-#-------------------------------------------------------#
-
+import math
 
 class quad_controller():
+
+    GAIN_YAW_CONTROL = 1.0
 
     def __init__(self):
 
@@ -85,13 +71,14 @@ class quad_controller():
         self.state_quad = numpy.zeros(3+3+3)
 
         # dy default, desired trajectory is staying still in origin
-        traj_class = trajectories_dictionary[0]
+        TrajectoryClass = trajectories_dictionary.trajectories_dictionary['StayAtRest']
         # zero vector
         zvec  = numpy.zeros(3)
         # Identity matrix
         Ident = numpy.array([[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]])
         # dy default
-        self.TrajGenerator = traj_class(zvec,Ident)
+        # self.TrajGenerator = TrajectoryClass(zvec,Ident)
+        self.TrajGenerator = TrajectoryClass(numpy.array([0.0,0.0,1.0]),Ident)
 
         # initialize counter for publishing to GUI
         # we only publish when self.PublishToGUI =1
@@ -106,9 +93,13 @@ class quad_controller():
         self.VelocityEstimator = Velocity_Filter(3,numpy.zeros(3),0.0)
 
         # controller selected by default
-        Cler_class = controllers_dictionary[4]
-        self.controller = Cler_class()
+        # ControllerClass = controllers_dictionary.controllers_dictionary[4]
+        # ControllerClass = controllers_dictionary.controllers_dictionary[2]
+        ControllerClass = controllers_dictionary.controllers_dictionary['ControllerPIDXYAndZBounded']
+        self.ControllerObject = ControllerClass()
 
+        YawControllerClass = yaw_controllers_dictionary.yaw_controllers_dictionary['YawRateControllerTrackReferencePsi']
+        self.YawControllerObject = YawControllerClass()
 
     def GET_STATE_(self):
 
@@ -124,20 +115,16 @@ class quad_controller():
 
                 self.flag_measurements = 1
 
-                x=bodies["x"]
-                y=bodies["y"]
-                z=bodies["z"]   
                 # position
+                x=bodies["x"]; y=bodies["y"]; z=bodies["z"]   
                 p = numpy.array([x,y,z])
 
                 # velocity
                 #v = numpy.array([data.vx,data.vy,data.vz])
                 v = self.VelocityEstimator.out(p,rospy.get_time())
 
-                roll = bodies["roll"]
-                pitch=-bodies["pitch"]
-                yaw  = bodies["yaw"]
-                # attitude: euler angles
+                # attitude: euler angles THESE COME IN DEGREES
+                roll = bodies["roll"]; pitch=-bodies["pitch"]; yaw  = bodies["yaw"]
                 ee = numpy.array([roll,pitch,yaw])
 
                 # collect all components of state
@@ -150,28 +137,29 @@ class quad_controller():
             self.flag_measurements = 0
 
     # callback when simulator publishes states
-    def get_state(self, data):
-
+    def get_state_from_simulator(self, data):
         # position
         p = numpy.array([data.x,data.y,data.z])
-
         # velocity
-        #v = numpy.array([data.vx,data.vy,data.vz])
-        v = self.VelocityEstimator.out(p,rospy.get_time())
-
-
+        v = numpy.array([data.vx,data.vy,data.vz])
+        #v = self.VelocityEstimator.out(p,rospy.get_time())
         # attitude: euler angles
         ee = numpy.array([data.roll,data.pitch,data.yaw])
-
         # collect all components of state
         self.state_quad = numpy.concatenate([p,v,ee])  
 
+    # callback when ROTORS simulator publishes states
+    def get_state_from_rotorS_simulator(self,odometry_rotor_s):
+
+        # RotorS has attitude inner loop that needs to known attitude of quad 
+        self.RotorSObject.rotor_s_attitude_for_control(odometry_rotor_s)
+        # get state from rotorS simulator
+        self.state_quad = self.RotorSObject.get_quad_state(odometry_rotor_s)        
+
     # for obtaining current desired state
     def traj_des(self):
-
         # time for trajectory generation
         time_TrajDes = rospy.get_time() - self.time_TrajDes_t0
-
         return self.TrajGenerator.output(time_TrajDes)
 
 
@@ -194,7 +182,7 @@ class quad_controller():
             package_path = rp.get_path('quad_control')
             self.file_handle  = file(package_path+'/../../'+ns+'_data_'+tt+'.txt', 'w')
 
-            # if GUI request data to be saved, set falg to true
+            # if GUI request data to be saved, set flag to true
             self.SaveDataFlag = True
         else:
             # if GUI request data NOT to be saved, set falg to False
@@ -218,9 +206,9 @@ class quad_controller():
 
             # if GUI request for reseting state of controller, parameters = 1
             elif int(req.parameters[0]) == 1:
-                self.controller.reset_estimate_xy()
+                self.ControllerObject.reset_estimate_xy()
             elif int(req.parameters[0]) == 2:
-                self.controller.reset_estimate_z()
+                self.ControllerObject.reset_estimate_z()
 
         # return message to Gui, to let it know resquest has been fulfilled
         return Controller_SrvResponse(True)
@@ -245,10 +233,10 @@ class quad_controller():
             parameters = numpy.array(req.parameters)
 
         # update class for Controller
-        Cler_class = controllers_dictionary[fg_Cler]
-        # Cler_class = controllers_dictionary[2]
+        ControllerClass = controllers_dictionary.controllers_dictionary[fg_Cler]
+        # ControllerClass = controllers_dictionary.controllers_dictionary[2]
 
-        self.controller = Cler_class(parameters)
+        self.ControllerObject = ControllerClass(parameters)
 
         # return message to Gui, to let it know resquest has been fulfilled
         return Controller_SrvResponse(True)
@@ -275,9 +263,9 @@ class quad_controller():
             TrajDes_parameters = numpy.array(req.parameters)   
 
         # update class for TrajectoryGenerator
-        traj_class = trajectories_dictionary[flagTrajDes]
+        TrajectoryClass = trajectories_dictionary.trajectories_dictionary[flagTrajDes]
 
-        self.TrajGenerator = traj_class(TrajDes_OffSet,TrajDes_Rotation,TrajDes_parameters)
+        self.TrajGenerator = TrajectoryClass(TrajDes_OffSet,TrajDes_Rotation,TrajDes_parameters)
 
         # we need to update initial time for trajectory generation
         self.time_TrajDes_t0 = rospy.get_time()
@@ -327,7 +315,7 @@ class quad_controller():
                     self.flagMOCAP = False
 
                     # subscribe again to simultor messages
-                    self.SubToSim = rospy.Subscriber("quad_state", quad_state, self.get_state) 
+                    self.SubToSim = rospy.Subscriber("quad_state", quad_state, self.get_state_from_simulator) 
 
                     # service has been provided
                     return Mocap_IdResponse(True,True)
@@ -445,32 +433,16 @@ class quad_controller():
             st_cmd.time  = rospy.get_time()
 
             # state of quad comes from QUALISYS, or other sensor
-            st_cmd.x     = self.state_quad[0]
-            st_cmd.y     = self.state_quad[1]
-            st_cmd.z     = self.state_quad[2]
-            st_cmd.vx    = self.state_quad[3]
-            st_cmd.vy    = self.state_quad[4]
-            st_cmd.vz    = self.state_quad[5]
-            st_cmd.roll  = self.state_quad[6]
-            st_cmd.pitch = self.state_quad[7]
-            st_cmd.yaw   = self.state_quad[8]
+            st_cmd.x     = self.state_quad[0]; st_cmd.y     = self.state_quad[1]; st_cmd.z     = self.state_quad[2]
+            st_cmd.vx    = self.state_quad[3]; st_cmd.vy    = self.state_quad[4]; st_cmd.vz    = self.state_quad[5]
+            st_cmd.roll  = self.state_quad[6]; st_cmd.pitch = self.state_quad[7]; st_cmd.yaw   = self.state_quad[8]
             
-            st_cmd.xd    = states_d[0]
-            st_cmd.yd    = states_d[1]
-            st_cmd.zd    = states_d[2]
-            st_cmd.vxd   = states_d[3]
-            st_cmd.vyd   = states_d[4]
-            st_cmd.vzd   = states_d[5]
+            st_cmd.xd    = states_d[0]; st_cmd.yd    = states_d[1]; st_cmd.zd    = states_d[2]
+            st_cmd.vxd   = states_d[3]; st_cmd.vyd   = states_d[4]; st_cmd.vzd   = states_d[5]
 
-            st_cmd.cmd_1     = Input_to_Quad[0]
-            st_cmd.cmd_2     = Input_to_Quad[1]
-            st_cmd.cmd_3     = Input_to_Quad[2]
-            st_cmd.cmd_4     = Input_to_Quad[3]
+            st_cmd.cmd_1 = Input_to_Quad[0]; st_cmd.cmd_2 = Input_to_Quad[1]; st_cmd.cmd_3 = Input_to_Quad[2]; st_cmd.cmd_4 = Input_to_Quad[3]
 
-            st_cmd.cmd_5     = 1500.0
-            st_cmd.cmd_6     = 1500.0
-            st_cmd.cmd_7     = 1500.0
-            st_cmd.cmd_8     = 1500.0
+            st_cmd.cmd_5 = 1500.0; st_cmd.cmd_6 = 1500.0; st_cmd.cmd_7 = 1500.0; st_cmd.cmd_8 = 1500.0
 
             self.pub.publish(st_cmd)     
 
@@ -479,25 +451,19 @@ class quad_controller():
                 # publish controller state
                 msg       = Controller_State()
                 msg.time  = rospy.get_time()
-                msg.d_est = self.controller.d_est
+                msg.d_est = self.ControllerObject.d_est
                 self.pub_ctr_st.publish(msg) 
         
     def PublishToQuad(self,Input_to_Quad):
 
         # create a message of the type quad_cmd, that the simulator subscribes to 
-        cmd = quad_cmd()
-        cmd.cmd_1 = Input_to_Quad[0];
-        cmd.cmd_2 = Input_to_Quad[1];
-        cmd.cmd_3 = Input_to_Quad[2];
-        cmd.cmd_4 = Input_to_Quad[3];
+        cmd  = quad_cmd()
 
-        cmd.cmd_5 = 1500.0
-        cmd.cmd_6 = 1500.0
-        cmd.cmd_7 = 1500.0
-        cmd.cmd_8 = 1500.0
-
+        cmd.cmd_1 = Input_to_Quad[0]; cmd.cmd_2 = Input_to_Quad[1]; cmd.cmd_3 = Input_to_Quad[2]; cmd.cmd_4 = Input_to_Quad[3];
+        
+        cmd.cmd_5 = 1500.0; cmd.cmd_6 = 1500.0; cmd.cmd_7 = 1500.0; cmd.cmd_8 = 1500.0
+        
         self.pub_cmd.publish(cmd)
-
 
     def control_compute(self):
 
@@ -517,9 +483,8 @@ class quad_controller():
 
         # controller needs to have access to STATE of the system
         # this can come from QUALISYS, a sensor, or the simulator
-        self.SubToSim = rospy.Subscriber("quad_state", quad_state, self.get_state) 
+        self.SubToSim = rospy.Subscriber("quad_state", quad_state, self.get_state_from_simulator) 
 
-        #-----------------------------------------------------------------------#
         #-----------------------------------------------------------------------#
         # TO SAVE DATA FLAG
         # by default, NO data is saved
@@ -532,7 +497,6 @@ class quad_controller():
 
 
         #-----------------------------------------------------------------------#
-        #-----------------------------------------------------------------------#
         # SERVICE FOR SELECTING DESIRED TRAJECTORY
         # by default, STAYING STILL IN ORIGIN IS DESIRED TRAJECTORY
         # self.flagTrajDes = 0
@@ -543,7 +507,6 @@ class quad_controller():
         self.time_TrajDes_t0 = rospy.get_time()
 
         #-----------------------------------------------------------------------#
-        #-----------------------------------------------------------------------#
         # flag for MOCAP is initialized as FALSE
         # flag for wheter Mocap is being used or not
         self.flagMOCAP    = False
@@ -552,26 +515,36 @@ class quad_controller():
         # Service is created, so that Mocap is turned ON or OFF whenever we want
         Save_MOCAP_service = rospy.Service('Mocap_Set_Id', Mocap_Id, self.handle_Mocap)
 
-
         # Service for providing list of available mocap bodies to GUI
         mocap_available_bodies = rospy.Service('MocapBodies', MocapBodies, self.handle_available_bodies)
 
-
-        #-----------------------------------------------------------------------#
         #-----------------------------------------------------------------------#
         # Service is created, so that user can change controller on GUI
         Chg_Contller = rospy.Service('Controller_GUI', Controller_Srv, self.handle_Controller_Srv)
 
-
-        #-----------------------------------------------------------------------#
         #-----------------------------------------------------------------------#
         # Service for publishing state of controller 
         # we use same type of service as above
         Contller_St = rospy.Service('Controller_State_GUI', Controller_Srv, self.handle_Controller_State_Srv)
 
+        #-----------------------------------------------------------------------#
 
+        self.RotorSObject = RotorSConverter()
+        self.RotorSFlag   = True
+
+
+        # subscriber: to odometry
+        # self.sub_odometry = rospy.Subscriber("/firefly/odometry_sensor1/odometry", Odometry, self.compute_cmd)
+        self.sub_odometry = rospy.Subscriber("/firefly/ground_truth/odometry", Odometry, self.get_state_from_rotorS_simulator) 
+
+        # # subscriber: to odometry
+        # # self.sub_odometry = rospy.Subscriber("/firefly/odometry_sensor1/odometry", Odometry, self.compute_cmd)
+        # self.sub_odometry_load = rospy.Subscriber("/firefly/ground_truth/odometry_load", Odometry, self.update_load_odometry) 
+
+        # publisher: command firefly motor speeds 
+        self.pub_motor_speeds = rospy.Publisher('/firefly/command/motor_speed', Actuators, queue_size=10)
+        #-----------------------------------------------------------------------#
         
-
         # rc_override = rospy.Publisher('mavros/rc/override',OverrideRCIn,queue_size=10)
         rc_override = rospy.Publisher('mavros/rc/override', OverrideRCIn, queue_size=100)
 
@@ -581,48 +554,63 @@ class quad_controller():
 
         t0 = rospy.get_time() 
 
+        self.IrisPlusConverterObject = IrisPlusConverter()
+
         while not rospy.is_shutdown():
 
             time = rospy.get_time()
 
-            # get state:
-            # if MOCAP in on we ask MOCAP
-            # if MOCAP in off, we are subscribed to Simulator topic
+            # get state: if MOCAP is ON we ask MOCAP; if MOCAP in OFF, we are subscribed to Simulator topic
             self.GET_STATE_()
+
+            #print(self.state_quad[0:3])
+            # print self.state_quad[6:9]
 
             # states for desired trajectory
             states_d = self.traj_des()
 
             # compute input to send to QUAD
-            Input_to_Quad = self.controller.output(time,self.state_quad,states_d)
+            desired_3d_force_quad = self.ControllerObject.output(time,self.state_quad,states_d)
+
+            euler_rad     = self.state_quad[6:9]*math.pi/180
+            euler_rad_dot = numpy.zeros(3)
+
+            # convert to iris + standard
+            state_for_yaw_controller = numpy.concatenate([euler_rad,euler_rad_dot])
+            input_for_yaw_controller = numpy.array([0.0,0.0])
+            yaw_rate = self.YawControllerObject.output(state_for_yaw_controller,input_for_yaw_controller)
             
+            self.IrisPlusConverterObject.set_rotation_matrix(euler_rad)
+            iris_plus_rc_input = self.IrisPlusConverterObject.input_conveter(desired_3d_force_quad,yaw_rate)
+
+
             # Publish commands to Quad
-            self.PublishToQuad(Input_to_Quad)
+            self.PublishToQuad(iris_plus_rc_input)
 
             # publish to GUI (it also contains publish state of Control to GUI)
-            self.PublishToGui(states_d,Input_to_Quad)
+            self.PublishToGui(states_d,iris_plus_rc_input)
 
 
-            # ORDER OF INPUTS IS VERY IMPORTANT
-            # roll,pitch,throttle,yaw_rate
+            # ORDER OF INPUTS IS VERY IMPORTANT: roll, pitch, throttle,yaw_rate
             # create message of type OverrideRCIn
             rc_cmd          = OverrideRCIn()
             other_channels  = numpy.array([1500,1500,1500,1500])
-            aux             = numpy.concatenate([Input_to_Quad,other_channels])
-            aux             = numpy.array(aux,dtype=numpy.uint16)
-            rc_cmd.channels = aux
-            # rc_cmd.channels = numpy.array(rc_cmd.channels,dtype=numpy.uint16)
-            # rospy.logwarn(rc_cmd.channels)
-            # rospy.logwarn(aux)
+            channels        = numpy.concatenate([iris_plus_rc_input,other_channels])
+            channels        = numpy.array(channels,dtype=numpy.uint16)
+            rc_cmd.channels = channels
             rc_override.publish(rc_cmd)
+
+            # publish message
+            # TOTAL_MASS = 1.66779; Force3D = numpy.array([0.0,0.0,TOTAL_MASS*9.85]); PsiStar = 0.0; self.pub_motor_speeds.publish(self.RotorSObject.rotor_s_message(Force3D,PsiStar))
+            self.pub_motor_speeds.publish(self.RotorSObject.rotor_s_message(desired_3d_force_quad,yaw_rate))
 
 
             if self.SaveDataFlag == True:
                 # if we want to save data
-                numpy.savetxt(self.file_handle, [concatenate([[rospy.get_time()],[self.flag_measurements], self.state_quad, states_d[0:9], Input_to_Quad,self.controller.d_est])],delimiter=' ')
+                numpy.savetxt(self.file_handle, [concatenate([[rospy.get_time()],[self.flag_measurements], self.state_quad, states_d[0:9], Input_to_Quad,self.ControllerObject.d_est])],delimiter=' ')
 
             # go to sleep
-            rate.sleep()    
+            rate.sleep() 
 
 
 if __name__ == '__main__':

@@ -130,12 +130,15 @@ class TrajectorySelectionPlugin(Plugin):
 
         # print(vars(self._widget))
 
+        rospy.logwarn('currently testing')
+        rospy.logwarn("/"+self.namespace+'TrajDes_GUI')
+
         try: 
             # time out of one second for waiting for service
-            rospy.wait_for_service(self.namespace+'TrajDes_GUI',1.0)
+            rospy.wait_for_service("/"+self.namespace+'TrajDes_GUI',1.0)
             
             try:
-                SettingTrajectory = rospy.ServiceProxy(self.namespace+'TrajDes_GUI', TrajDes_Srv)
+                SettingTrajectory = rospy.ServiceProxy("/"+self.namespace+'TrajDes_GUI', TrajDes_Srv)
 
                 # self._widget.TrajSelect.currentIndex() is the tab number
                 # first tab is 0
@@ -148,6 +151,8 @@ class TrajectorySelectionPlugin(Plugin):
                 if self._widget.TrajSelect.currentIndex() == 1:
                     traj,offset,rotation,parameters = self.circle()
 
+                rospy.logwarn(traj)
+
                 reply = SettingTrajectory(traj,offset,rotation,parameters)
 
 
@@ -159,11 +164,13 @@ class TrajectorySelectionPlugin(Plugin):
 
 
             except rospy.ServiceException, e:
+                rospy.logwarn('Proxy for service that sets desired trajectory FAILED')
                 self._widget.Success.setChecked(False) 
                 self._widget.Failure.setChecked(True) 
                 # print "Service call failed: %s"%e   
             
         except:
+            rospy.logwarn('Timeout for service that sets desired trajectory')
             self._widget.Success.setChecked(False) 
             self._widget.Failure.setChecked(True) 
             # print "Service not available ..."        
@@ -172,7 +179,7 @@ class TrajectorySelectionPlugin(Plugin):
 
     def fixed_point(self):
 
-        traj = 0
+        traj = 'StayAtRest'
         
         x = self._widget.box_x.value()
         y = self._widget.box_y.value()
@@ -187,7 +194,7 @@ class TrajectorySelectionPlugin(Plugin):
 
     def circle(self):
 
-        traj = 1
+        traj = 'DescribeCircle'
         x = self._widget.box_x_circle.value()
         y = self._widget.box_y_circle.value()
         z = self._widget.box_z_circle.value()
